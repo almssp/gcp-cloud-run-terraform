@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run from repository root (this repo / freestar).
-# Backend is declared in backend.tf (partial gcs); init supplies bucket/prefix via env or --backend-config FILE.
+# Backend is declared in backend.tf (partial gcs); init supplies bucket/prefix from TF_STATE_BUCKET only.
 # Init runs first, then terraform workspace select (dev / prod — workspaces must exist).
 # Plan/apply: pass multiple --var-file (e.g. common.tfvars then dev.tfvars); later files override.
 set -euo pipefail
@@ -23,9 +23,8 @@ Commands:
   apply        terraform apply -input=false tfplan
   all          fmt, init, workspace, validate, plan, apply
 
-Backend init (one of):
-  --backend-config FILE   HCL file with bucket, prefix (GCS backend; no workspace_key_prefix)
-  Or set TF_STATE_BUCKET (required for env-based init); GCS state prefix is fixed to freestar in this repo, same as CI.
+Backend init:
+  Set TF_STATE_BUCKET (required). GCS state prefix is fixed to freestar in this repo, same as CI.
 
 Options:
   --workspace NAME        Terraform workspace (dev or prod)
@@ -43,16 +42,11 @@ EOF
   exit 1
 }
 
-BACKEND_CONFIG=""
 WORKSPACE=""
 CMD=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --backend-config)
-      BACKEND_CONFIG="${2:?}"
-      shift 2
-      ;;
     --workspace)
       WORKSPACE="${2:?}"
       shift 2
@@ -78,24 +72,17 @@ done
 [[ -n "$CMD" ]] || usage
 
 run_init() {
-  if [[ -n "${BACKEND_CONFIG}" ]]; then
-    [[ -f "$BACKEND_CONFIG" ]] || {
-      echo "Backend config not found: $BACKEND_CONFIG" >&2
-      exit 1
-    }
-    terraform init -input=false -backend-config="$BACKEND_CONFIG"
-  elif [[ -n "${TF_STATE_BUCKET:-}" ]]; then
-    terraform init -input=false \
-      -backend-config="bucket=${TF_STATE_BUCKET}" \
-      -backend-config="prefix=freestar"
-  else
+  if [[ -z "${TF_STATE_BUCKET:-}" ]]; then
     if [[ -n "${TF_IN_AUTOMATION:-}" ]]; then
       echo "::error::Set TF_STATE_BUCKET (repository or environment variable)" >&2
     else
-      echo "Backend: set TF_STATE_BUCKET or pass --backend-config FILE" >&2
+      echo "Backend: set TF_STATE_BUCKET" >&2
     fi
     exit 1
   fi
+  terraform init -input=false \
+    -backend-config="bucket=${TF_STATE_BUCKET}" \
+    -backend-config="prefix=freestar"
 }
 
 require_workspace() {

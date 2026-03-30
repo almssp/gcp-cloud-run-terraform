@@ -12,7 +12,7 @@ A **showcase blueprint** for deploying **Google Cloud Run** with **Terraform** a
 | **Environment isolation** | Terraform workspaces **`dev`** and **`prod`** with state objects under one GCS **`prefix`** (the GCS backend does not support S3’s `workspace_key_prefix`; each workspace is a separate object under that prefix). |
 | **Clear ownership of config** | Each app uses **`common.tfvars`** (shared) + **`dev.tfvars` / `prod.tfvars`** (env-specific); PRs show exactly what changes per environment. |
 | **Safer automation** | GitHub Actions runs **fmt → validate → plan → apply**; **apply** uses only the **plan artifact**. **No `workflow_dispatch`**. **Every app** under **`apps/*/`** gets **dev** and **prod** plan/apply on each qualifying PR (path-filtered). |
-| **No secrets in source** | **`backend.tf`** declares `backend "gcs" {}` only; **bucket / prefix** are supplied at **`terraform init`** (env vars in CI, or `--backend-config` locally). |
+| **No secrets in source** | **`backend.tf`** declares `backend "gcs" {}` only; **bucket / prefix** are supplied at **`terraform init`** via **`TF_STATE_BUCKET`** (and a fixed prefix in `scripts/terraform.sh`). |
 | **Operational guardrails** | **Workflow concurrency** queues overlapping runs per **repository + app + Terraform workspace** so different apps under `apps/` do not block each other. |
 
 ---
@@ -20,7 +20,7 @@ A **showcase blueprint** for deploying **Google Cloud Run** with **Terraform** a
 ## What’s included
 
 - **Terraform** — Cloud Run **v2** service, optional **VPC connector**, optional **public** access via `INGRESS_TRAFFIC_ALL` + `roles/run.invoker` for `allUsers` when enabled.
-- **`scripts/terraform.sh`** — **init** from **`TF_STATE_BUCKET`** (or **`--backend-config`**); GCS **`prefix`** is **`freestar`** in-script. **Workspace select**, **fmt / validate / plan / apply**. **GitHub Actions calls this script** for Terraform steps so CI matches local usage.
+- **`scripts/terraform.sh`** — **init** from **`TF_STATE_BUCKET`**; GCS **`prefix`** is **`freestar`** in-script. **Workspace select**, **fmt / validate / plan / apply**. **GitHub Actions calls this script** for Terraform steps so CI matches local usage.
 - **`.github/workflows/terraform.yml`** — **PRs to `main`** (path-filtered). Lists app folders under **`apps/`**, then **fmt** once, **validate** once (dev + prod workspaces), then **matrix plan/apply** for **each app** × **dev** and **prod**. **Fork PRs** run **discover + fmt** only (no GCP).
 - **Example app** — `apps/example-api/` with **common + dev + prod** tfvars (illustrative `project_id` and image; adjust for your GCP project).
 
@@ -166,8 +166,6 @@ export TF_STATE_BUCKET=your-bucket
 ./scripts/terraform.sh apply --workspace dev
 ```
 
-You can still pass **`--backend-config /path/to/backend.hcl`** instead of `TF_STATE_*` if you prefer a file for init.
-
 ---
 
 ## GitHub setup
@@ -244,6 +242,7 @@ sequenceDiagram
 
 ## Possible next steps
 
+- **Lint `.tf` and check `tfvars`** — **tflint** on root and `modules/`; for **`apps/*/*.tfvars`**, run tflint with **`--var-file`** (common + env) or add **checkov** / policy-as-code in CI alongside **`terraform fmt`** and **`terraform validate`**.
 - **Workload Identity Federation** instead of long-lived JSON keys for GitHub → GCP.
 - **Atlantis** or similar for a dedicated plan/apply UI and policy hooks.
 - **CODEOWNERS** on `modules/**` and per-app `apps/` paths (complements environment approvals above).
