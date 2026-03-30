@@ -22,7 +22,7 @@ A **showcase blueprint** for deploying **Google Cloud Run** with **Terraform** a
 - **Terraform** — Cloud Run **v2** service, optional **VPC connector**, optional **public** access via `INGRESS_TRAFFIC_ALL` + `roles/run.invoker` for `allUsers` when enabled.
 - **`scripts/terraform.sh`** — **init** from **`TF_STATE_BUCKET`** (or **`--backend-config`**); GCS **`prefix`** is **`freestar`** in-script. **Workspace select**, **fmt / validate / plan / apply**. **GitHub Actions calls this script** for Terraform steps so CI matches local usage.
 - **`.github/workflows/terraform.yml`** — **PRs to `main`** (path-filtered). Lists app folders under **`apps/`**, then **fmt** once, **validate** once (dev + prod workspaces), then **matrix plan/apply** for **each app** × **dev** and **prod**. **Fork PRs** run **discover + fmt** only (no GCP).
-- **Example app** — `apps/example-api/` with **common + dev + prod** tfvars (illustrative project IDs and runtime SA names you can replace).
+- **Example app** — `apps/example-api/` with **common + dev + prod** tfvars (illustrative `project_id` and image; adjust for your GCP project).
 
 ---
 
@@ -32,7 +32,7 @@ A **showcase blueprint** for deploying **Google Cloud Run** with **Terraform** a
 flowchart TB
   subgraph people [People and platform]
     eng[Engineers edit Terraform and tfvars]
-    plat[Platform provisions bucket CI SA runtime SAs]
+    plat[Platform provisions bucket and CI deploy SA]
   end
   subgraph github [GitHub]
     repo[This repository]
@@ -70,7 +70,7 @@ flowchart TB
 
 ## CI job chain
 
-**discover** lists subdirectories of **`apps/`** (fails if none). **fmt** runs on the repo. **validate** runs the **shared root module** in workspace **dev**, then **prod** (no per-app matrix — tfvars are only needed at plan). **plan-dev** and **plan-prod** each use a **matrix over apps** and upload **`tfplan-<app>-dev`** / **`tfplan-<app>-prod`**. **apply-*** downloads the matching artifact and applies.
+**discover** lists subdirectories of **`apps/`** (the workflow expects at least one app folder). **fmt** runs on the repo. **validate** runs the **shared root module** in workspace **dev**, then **prod** (no per-app matrix — tfvars are only needed at plan). **plan-dev** and **plan-prod** each use a **matrix over apps** and upload **`tfplan-<app>-dev`** / **`tfplan-<app>-prod`**. **apply-*** downloads the matching artifact and applies.
 
 ```mermaid
 flowchart TB
@@ -140,7 +140,7 @@ terraform workspace new prod
 |------|------|
 | `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf` | Root module wiring |
 | `backend.tf` | Partial **`backend "gcs" {}`** — credentials for state come from ADC / init flags, not hard-coded bucket names |
-| `modules/cloud_run_app/` | Cloud Run v2 + optional VPC + optional public IAM |
+| `modules/cloud_run_app/` | Cloud Run v2, **`google_service_account`** for the runtime identity (id = **`{service_name}-runtime-{workspace}`**), optional VPC, optional **`allUsers`** invoker |
 | `apps/<app>/common.tfvars` | Shared inputs for that app |
 | `apps/<app>/dev.tfvars`, `prod.tfvars` | Per-environment overrides |
 | `scripts/terraform.sh` | Wrapper used **locally and in CI** for init / workspace / fmt / validate / plan / apply |
@@ -189,13 +189,22 @@ In **`.github/workflows/terraform.yml`**, only **apply-dev** and **apply-prod** 
 
 ---
 
-## Deploy service account (typical permissions)
+## Deploy and runtime service accounts
 
-- Read/write objects for your state **prefix** in the GCS bucket.
-- Manage Cloud Run in the target **project_id** (from tfvars).
-- **Service Account User** on the **runtime** service account referenced in tfvars.
-- **Artifact Registry** reader if images are private.
-- VPC / connector usage if you set **`vpc_connector`**.
+CI and local Terraform authenticate as the **deploy** service account (**`GCP_SA_KEY`**). The **`cloud_run_app`** module creates a separate **runtime** **`google_service_account`** used as the Cloud Run revision identity. Its **`account_id`** is **`{service_name}-runtime-{terraform.workspace}`** (service name normalized to lowercase with underscores as hyphens, truncated to 30 characters). Emails are in **`terraform output`** (`runtime_service_account_email`, `runtime_service_account_id`).
+
+**Deploy** SA needs, in the target project (and on state in GCS): permission to read/write state; to manage Cloud Run (e.g. **`roles/run.admin`**); to create service accounts (**`roles/iam.serviceAccountAdmin`** or **`roles/iam.serviceAccountCreator`**); and **Service Account User** (**`roles/iam.serviceAccountUser`**) on **each** runtime SA the module creates (dev and prod workspaces each have their own runtime SA). Use **Artifact Registry** reader and any VPC-related roles if your tfvars require them.
+
+**Project IAM for logging and metrics** on the runtime SA (**`roles/logging.logWriter`**, **`roles/monitoring.metricWriter`**) is **not** defined in this repo (that would require project-level IAM admin on the deploy identity). Grant those bindings separately per runtime account if you want default Cloud Logging / Cloud Monitoring behavior for the workload, for example:
+
+```bash
+RUNTIME_SA="$(terraform output -raw runtime_service_account_email)"
+PROJECT="your-project-id"
+gcloud projects add-iam-policy-binding "$PROJECT" \
+  --member="serviceAccount:${RUNTIME_SA}" --role="roles/logging.logWriter"
+gcloud projects add-iam-policy-binding "$PROJECT" \
+  --member="serviceAccount:${RUNTIME_SA}" --role="roles/monitoring.metricWriter"
+```
 
 ---
 
@@ -203,10 +212,10 @@ In **`.github/workflows/terraform.yml`**, only **apply-dev** and **apply-prod** 
 
 | Area | Notes |
 |------|--------|
-| **Service** | `project_id`, `region`, `service_name`, `image`, `container_port`, `cpu`, `memory`, `labels` |
+| **Service** | `project_id`, `region`, `service_name` (also drives runtime SA id), `image`, `container_port`, `cpu`, `memory`, `labels` |
 | **Networking** | `ingress`; optional **`vpc_connector`**, **`vpc_egress`** (`PRIVATE_RANGES_ONLY` / `ALL_TRAFFIC`) |
-| **Public HTTP** | **`allow_unauthenticated`** with **`INGRESS_TRAFFIC_ALL`** (example-api enables this); org policy may block `allUsers` |
-| **Identity** | **`runtime_service_account_email`** (must exist in GCP) |
+| **Public HTTP** | When **`allow_unauthenticated`** is true and ingress allows external traffic, the module grants **`roles/run.invoker`** to **`allUsers`** |
+| **Identity** | Runtime SA **`{service_name}-runtime-{workspace}`** (derived from **`service_name`**; module creates it) |
 
 ---
 
