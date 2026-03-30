@@ -11,7 +11,11 @@ variable "region" {
 
 variable "service_name" {
   type        = string
-  description = "Cloud Run service name."
+  description = "Cloud Run service name. Runtime SA account_id is derived as lower(service_name with _→-) plus -runtime- plus terraform.workspace (truncated to 30 chars)."
+  validation {
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9_-]{0,22}$", var.service_name))
+    error_message = "service_name must start with a letter; use letters, digits, hyphens, underscores only; keep it short so the derived runtime account_id fits GCP limits."
+  }
 }
 
 variable "image" {
@@ -41,11 +45,6 @@ variable "memory" {
   type        = string
   description = "Memory limit (e.g. 512Mi)."
   default     = "512Mi"
-}
-
-variable "runtime_service_account_email" {
-  type        = string
-  description = "Email of the runtime service account for the Cloud Run revision (platform-provided)."
 }
 
 variable "labels" {

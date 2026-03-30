@@ -1,3 +1,16 @@
+locals {
+  service_slug               = lower(replace(var.service_name, "_", "-"))
+  runtime_account_id_raw     = "${local.service_slug}-runtime-${terraform.workspace}"
+  runtime_service_account_id = substr(local.runtime_account_id_raw, 0, 30)
+}
+
+resource "google_service_account" "runtime" {
+  project      = var.project_id
+  account_id   = local.runtime_service_account_id
+  display_name = "Cloud Run runtime (${var.service_name}, ${terraform.workspace})"
+  description  = "Runs ${var.service_name} revisions (${terraform.workspace})."
+}
+
 resource "google_cloud_run_v2_service" "app" {
   name     = var.service_name
   location = var.region
@@ -6,7 +19,7 @@ resource "google_cloud_run_v2_service" "app" {
   labels   = var.labels
 
   template {
-    service_account = var.runtime_service_account_email
+    service_account = google_service_account.runtime.email
 
     containers {
       image = var.image

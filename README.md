@@ -191,11 +191,17 @@ In **`.github/workflows/terraform.yml`**, only **apply-dev** and **apply-prod** 
 
 ## Deploy service account (typical permissions)
 
+The identity in **`GCP_SA_KEY`** (your **deploy** service account) is separate from each **runtime** service account the **`cloud_run_app`** module creates. The runtime **`account_id`** is derived as **`{service_name}-runtime-{terraform.workspace}`** (normalized: lowercase, underscores → hyphens; truncated to 30 characters). Set **`service_name`** in **`common.tfvars`**; use Terraform workspaces **`dev`** and **`prod`**. Creating Cloud Run requires **`iam.serviceAccounts.actAs`** on that SA, granted with **`roles/iam.serviceAccountUser`** for the deploy SA on each runtime account (see **`runtime_service_account_id`** / **`runtime_service_account_email`** outputs).
+
 - Read/write objects for your state **prefix** in the GCS bucket.
-- Manage Cloud Run in the target **project_id** (from tfvars).
-- **Service Account User** on the **runtime** service account referenced in tfvars.
+- Manage Cloud Run in the target **project_id** (from tfvars), e.g. **`roles/run.admin`** (plus **`roles/iam.serviceAccountUser`** on the runtime SA as above).
+- **Service Account User** (`roles/iam.serviceAccountUser`) **on each** derived runtime account (**dev** vs **prod** workspace ⇒ different **`account_id`s**) **for** the deploy service account. Use **`terraform output`** (`runtime_service_account_email` / `runtime_service_account_id`) after apply, or grant on each `ACCOUNT_ID@PROJECT_ID.iam.gserviceaccount.com`.
 - **Artifact Registry** reader if images are private.
 - VPC / connector usage if you set **`vpc_connector`**.
+
+If apply fails with **`Permission 'iam.serviceaccounts.actAs' denied`**, grant **Service Account User** to the deploy SA on the runtime account in the error message.
+
+**Runtime service account (Terraform):** The **`modules/cloud_run_app`** module defines **`google_service_account`** plus **logging** / **monitoring** project IAM. The deploy SA needs permission to **create** service accounts on the project (e.g. **`roles/iam.serviceAccountAdmin`** or **`roles/iam.serviceAccountCreator`**). If a GCP account with the same derived **`account_id`** already exists, **import** it into the matching workspace state or remove it before apply.
 
 ---
 
@@ -203,10 +209,10 @@ In **`.github/workflows/terraform.yml`**, only **apply-dev** and **apply-prod** 
 
 | Area | Notes |
 |------|--------|
-| **Service** | `project_id`, `region`, `service_name`, `image`, `container_port`, `cpu`, `memory`, `labels` |
+| **Service** | `project_id`, `region`, `service_name` (also drives runtime SA id), `image`, `container_port`, `cpu`, `memory`, `labels` |
 | **Networking** | `ingress`; optional **`vpc_connector`**, **`vpc_egress`** (`PRIVATE_RANGES_ONLY` / `ALL_TRAFFIC`) |
 | **Public HTTP** | **`allow_unauthenticated`** with **`INGRESS_TRAFFIC_ALL`** (example-api enables this); org policy may block `allUsers` |
-| **Identity** | **`runtime_service_account_email`** (must exist in GCP) |
+| **Identity** | Runtime SA **`{service_name}-runtime-{workspace}`** (derived from **`service_name`**; module creates it) |
 
 ---
 

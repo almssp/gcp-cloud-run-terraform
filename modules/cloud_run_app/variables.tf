@@ -30,10 +30,6 @@ variable "memory" {
   type = string
 }
 
-variable "runtime_service_account_email" {
-  type = string
-}
-
 variable "labels" {
   type    = map(string)
   default = {}
