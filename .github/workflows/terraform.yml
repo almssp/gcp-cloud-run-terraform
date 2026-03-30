@@ -1,3 +1,4 @@
+# One workflow: format once, validate the shared root module once, then plan/apply every app under apps/*/ in parallel.
 name: Terraform Cloud Run
 
 on:
@@ -17,302 +18,197 @@ permissions:
 
 env:
   TF_IN_AUTOMATION: 1
-  TF_VAR_FILE_APP: ${{ vars.TF_APP || 'example-api' }}
-  TF_STATE_PREFIX_BASE: ${{ vars.TF_STATE_PREFIX_BASE || 'freestar' }}
-  TF_WORKSPACE_KEY_PREFIX: ${{ vars.TF_WORKSPACE_KEY_PREFIX || 'env' }}
 
 jobs:
-  detect:
-    name: detect
+  discover:
+    name: discover apps
     runs-on: ubuntu-latest
     outputs:
-      run_dev: ${{ steps.pick.outputs.run_dev }}
-      run_prod: ${{ steps.pick.outputs.run_prod }}
-      validate_workspace: ${{ steps.pick.outputs.validate_workspace }}
+      apps: ${{ steps.apps.outputs.apps }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Decide dev or prod (or both) from diff
-        id: pick
-        env:
-          BASE_REF: ${{ github.base_ref }}
+      - id: apps
         run: |
-          git fetch origin "${BASE_REF}" --depth=1 2>/dev/null || true
-          DIFF=$(git diff --name-only "origin/${BASE_REF}...HEAD" || true)
-          APP="${TF_VAR_FILE_APP}"
-
-          run_dev=false
-          run_prod=false
-
-          shared='^(\.github/workflows/|.*\.tf$|modules/|apps/'"${APP}"'/common\.tfvars)'
-          if echo "${DIFF}" | grep -qE "${shared}"; then
-            run_dev=true
-            run_prod=true
-          fi
-          if echo "${DIFF}" | grep -qF "apps/${APP}/dev.tfvars"; then
-            run_dev=true
-          fi
-          if echo "${DIFF}" | grep -qF "apps/${APP}/prod.tfvars"; then
-            run_prod=true
-          fi
-
-          if [[ "${run_dev}" != "true" && "${run_prod}" != "true" ]]; then
-            run_dev=true
-          fi
-
-          if [[ "${run_dev}" == "true" ]]; then
-            validate_workspace=dev
-          else
-            validate_workspace=prod
-          fi
-
-          echo "run_dev=${run_dev}" >> "$GITHUB_OUTPUT"
-          echo "run_prod=${run_prod}" >> "$GITHUB_OUTPUT"
-          echo "validate_workspace=${validate_workspace}" >> "$GITHUB_OUTPUT"
-          echo "Detected: run_dev=${run_dev} run_prod=${run_prod} validate_workspace=${validate_workspace}"
+          python3 << 'PY'
+          import json, os
+          root = "apps"
+          names = sorted(
+              d
+              for d in os.listdir(root)
+              if os.path.isdir(os.path.join(root, d)) and not d.startswith(".")
+          )
+          if not names:
+              print("::error::No app directories under apps/")
+              raise SystemExit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"apps={json.dumps(names)}\n")
+          print("Apps:", names)
+          PY
 
   fmt:
     name: fmt
-    needs: [detect]
-    if: needs.detect.outputs.run_dev == 'true' || needs.detect.outputs.run_prod == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
-
-      - name: Terraform fmt
-        run: terraform fmt -check -recursive
+      - run: bash scripts/terraform.sh fmt
 
   validate:
     name: validate
-    needs: [detect, fmt]
-    if: (needs.detect.outputs.run_dev == 'true' || needs.detect.outputs.run_prod == 'true') && (github.event.pull_request.head.repo.full_name == github.repository)
+    needs: [fmt]
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    environment: ${{ needs.detect.outputs.validate_workspace }}
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
     concurrency:
-      group: terraform-${{ github.repository }}-${{ vars.TF_APP || 'example-api' }}-validate-${{ github.event.pull_request.number }}
+      group: terraform-${{ github.repository }}-validate
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check var files exist
-        run: |
-          test -f "apps/${TF_VAR_FILE_APP}/common.tfvars"
-          test -f "apps/${TF_VAR_FILE_APP}/${{ needs.detect.outputs.validate_workspace }}.tfvars"
-
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Terraform Init
-        env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-        run: |
-          test -n "${TF_STATE_BUCKET}" || { echo "::error::Set repository or environment variable TF_STATE_BUCKET"; exit 1; }
-          terraform init -input=false \
-            -backend-config="bucket=${TF_STATE_BUCKET}" \
-            -backend-config="prefix=${TF_STATE_PREFIX_BASE}" \
-            -backend-config="workspace_key_prefix=${TF_WORKSPACE_KEY_PREFIX}"
-
-      - name: Terraform workspace select
-        run: terraform workspace select "${{ needs.detect.outputs.validate_workspace }}"
-
-      - name: Terraform Validate
-        run: terraform validate
+      - name: Terraform validate (dev)
+        run: bash scripts/terraform.sh validate --workspace dev
+      - name: Terraform validate (prod)
+        run: bash scripts/terraform.sh validate --workspace prod
 
   plan-dev:
     name: plan dev
-    needs: [detect, validate]
-    if: needs.detect.outputs.run_dev == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [discover, validate]
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
     runs-on: ubuntu-latest
-    environment: dev
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
     concurrency:
-      group: terraform-${{ github.repository }}-${{ vars.TF_APP || 'example-api' }}-dev
+      group: terraform-${{ github.repository }}-${{ matrix.app }}-dev
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check var files exist
+      - name: Check var files
         run: |
-          test -f "apps/${TF_VAR_FILE_APP}/common.tfvars"
-          test -f "apps/${TF_VAR_FILE_APP}/dev.tfvars"
-
+          test -f "apps/${{ matrix.app }}/common.tfvars"
+          test -f "apps/${{ matrix.app }}/dev.tfvars"
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Terraform Init
-        env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      - name: Terraform plan
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${TF_STATE_BUCKET}" \
-            -backend-config="prefix=${TF_STATE_PREFIX_BASE}" \
-            -backend-config="workspace_key_prefix=${TF_WORKSPACE_KEY_PREFIX}"
-
-      - name: Terraform workspace select
-        run: terraform workspace select dev
-
-      - name: Terraform Plan
-        run: |
-          terraform plan -input=false \
-            -var-file="apps/${TF_VAR_FILE_APP}/common.tfvars" \
-            -var-file="apps/${TF_VAR_FILE_APP}/dev.tfvars" \
-            -out=tfplan
-
+          bash scripts/terraform.sh plan --workspace dev \
+            --var-file "apps/${{ matrix.app }}/common.tfvars" \
+            --var-file "apps/${{ matrix.app }}/dev.tfvars"
       - uses: actions/upload-artifact@v4
         with:
-          name: tfplan-dev
+          name: tfplan-${{ matrix.app }}-dev
           path: tfplan
           if-no-files-found: error
 
   apply-dev:
     name: apply dev
-    needs: [plan-dev]
+    needs: [discover, plan-dev]
     if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
     runs-on: ubuntu-latest
     environment: dev
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
     concurrency:
-      group: terraform-${{ github.repository }}-${{ vars.TF_APP || 'example-api' }}-dev
+      group: terraform-${{ github.repository }}-${{ matrix.app }}-dev
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
-
       - uses: actions/download-artifact@v4
         with:
-          name: tfplan-dev
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+          name: tfplan-${{ matrix.app }}-dev
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Terraform Init
-        env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-        run: |
-          terraform init -input=false \
-            -backend-config="bucket=${TF_STATE_BUCKET}" \
-            -backend-config="prefix=${TF_STATE_PREFIX_BASE}" \
-            -backend-config="workspace_key_prefix=${TF_WORKSPACE_KEY_PREFIX}"
-
-      - name: Terraform workspace select
-        run: terraform workspace select dev
-
-      - name: Terraform Apply
-        run: terraform apply -input=false tfplan
+      - run: bash scripts/terraform.sh apply --workspace dev
 
   plan-prod:
     name: plan prod
-    needs: [detect, validate]
-    if: needs.detect.outputs.run_prod == 'true' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: [discover, validate]
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
     runs-on: ubuntu-latest
-    environment: prod
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
     concurrency:
-      group: terraform-${{ github.repository }}-${{ vars.TF_APP || 'example-api' }}-prod
+      group: terraform-${{ github.repository }}-${{ matrix.app }}-prod
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
-      - name: Check var files exist
+      - name: Check var files
         run: |
-          test -f "apps/${TF_VAR_FILE_APP}/common.tfvars"
-          test -f "apps/${TF_VAR_FILE_APP}/prod.tfvars"
-
+          test -f "apps/${{ matrix.app }}/common.tfvars"
+          test -f "apps/${{ matrix.app }}/prod.tfvars"
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Terraform Init
-        env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+      - name: Terraform plan
         run: |
-          terraform init -input=false \
-            -backend-config="bucket=${TF_STATE_BUCKET}" \
-            -backend-config="prefix=${TF_STATE_PREFIX_BASE}" \
-            -backend-config="workspace_key_prefix=${TF_WORKSPACE_KEY_PREFIX}"
-
-      - name: Terraform workspace select
-        run: terraform workspace select prod
-
-      - name: Terraform Plan
-        run: |
-          terraform plan -input=false \
-            -var-file="apps/${TF_VAR_FILE_APP}/common.tfvars" \
-            -var-file="apps/${TF_VAR_FILE_APP}/prod.tfvars" \
-            -out=tfplan
-
+          bash scripts/terraform.sh plan --workspace prod \
+            --var-file "apps/${{ matrix.app }}/common.tfvars" \
+            --var-file "apps/${{ matrix.app }}/prod.tfvars"
       - uses: actions/upload-artifact@v4
         with:
-          name: tfplan-prod
+          name: tfplan-${{ matrix.app }}-prod
           path: tfplan
           if-no-files-found: error
 
   apply-prod:
     name: apply prod
-    needs: [plan-prod]
+    needs: [discover, plan-prod]
     if: github.event.pull_request.head.repo.full_name == github.repository
+    strategy:
+      fail-fast: false
+      matrix:
+        app: ${{ fromJson(needs.discover.outputs.apps) }}
     runs-on: ubuntu-latest
     environment: prod
+    env:
+      TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
     concurrency:
-      group: terraform-${{ github.repository }}-${{ vars.TF_APP || 'example-api' }}-prod
+      group: terraform-${{ github.repository }}-${{ matrix.app }}-prod
       cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
-
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.9.8"
           terraform_wrapper: false
-
       - uses: actions/download-artifact@v4
         with:
-          name: tfplan-prod
-
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+          name: tfplan-${{ matrix.app }}-prod
+      - uses: google-github-actions/auth@v2
         with:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
-
-      - name: Terraform Init
-        env:
-          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-        run: |
-          terraform init -input=false \
-            -backend-config="bucket=${TF_STATE_BUCKET}" \
-            -backend-config="prefix=${TF_STATE_PREFIX_BASE}" \
-            -backend-config="workspace_key_prefix=${TF_WORKSPACE_KEY_PREFIX}"
-
-      - name: Terraform workspace select
-        run: terraform workspace select prod
-
-      - name: Terraform Apply
-        run: terraform apply -input=false tfplan
+      - run: bash scripts/terraform.sh apply --workspace prod

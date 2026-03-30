@@ -1,4 +1,4 @@
-# Partial GCS backend: bucket, prefix, and workspace_key_prefix are supplied at init time
+# Partial GCS backend: bucket and prefix are supplied at init time (GCS has no workspace_key_prefix; workspaces use separate objects under prefix).
 # (terraform init -backend-config=...). Same pattern as a dedicated backend block in versions.tf.
 
 terraform {

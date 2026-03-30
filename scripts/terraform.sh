@@ -24,11 +24,8 @@ Commands:
   all          fmt, init, workspace, validate, plan, apply
 
 Backend init (one of):
-  --backend-config FILE   HCL file with bucket, prefix, workspace_key_prefix
-  Or set environment variables (same names as CI):
-    TF_STATE_BUCKET                 (required)
-    TF_STATE_PREFIX_BASE            optional, default freestar
-    TF_WORKSPACE_KEY_PREFIX         optional, default env
+  --backend-config FILE   HCL file with bucket, prefix (GCS backend; no workspace_key_prefix)
+  Or set TF_STATE_BUCKET (required for env-based init); GCS state prefix is fixed to freestar in this repo, same as CI.
 
 Options:
   --workspace NAME        Terraform workspace (dev or prod)
@@ -36,8 +33,6 @@ Options:
 
 Examples:
   export TF_STATE_BUCKET=my-org-tf-state
-  export TF_STATE_PREFIX_BASE=freestar
-  export TF_WORKSPACE_KEY_PREFIX=env
   scripts/terraform.sh init
   scripts/terraform.sh validate --workspace dev
   scripts/terraform.sh plan --workspace dev \
@@ -90,14 +85,15 @@ run_init() {
     }
     terraform init -input=false -backend-config="$BACKEND_CONFIG"
   elif [[ -n "${TF_STATE_BUCKET:-}" ]]; then
-    local prefix="${TF_STATE_PREFIX_BASE:-freestar}"
-    local wkp="${TF_WORKSPACE_KEY_PREFIX:-env}"
     terraform init -input=false \
       -backend-config="bucket=${TF_STATE_BUCKET}" \
-      -backend-config="prefix=${prefix}" \
-      -backend-config="workspace_key_prefix=${wkp}"
+      -backend-config="prefix=freestar"
   else
-    echo "Backend: set TF_STATE_BUCKET (and optional TF_STATE_PREFIX_BASE, TF_WORKSPACE_KEY_PREFIX) or pass --backend-config FILE" >&2
+    if [[ -n "${TF_IN_AUTOMATION:-}" ]]; then
+      echo "::error::Set TF_STATE_BUCKET (repository or environment variable)" >&2
+    else
+      echo "Backend: set TF_STATE_BUCKET or pass --backend-config FILE" >&2
+    fi
     exit 1
   fi
 }
